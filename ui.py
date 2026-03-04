@@ -12,21 +12,20 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 MAIN_MENU_TEXT = (
     "🎵 <b>Музыкальный бот</b>\n\n"
-    "Привет! Я помогу найти и скачать любую музыку. "
-    "Выбери раздел ниже 👇"
+    "Привет! Просто напишите название трека — я найду его в YouTube Music 🎧\n"
+    "Или выбери раздел ниже 👇"
 )
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔍 Найти трек",   callback_data="menu:search")
     kb.button(text="🌊 Моя волна",    callback_data="menu:wave")
     kb.button(text="🔥 Топ",          callback_data="menu:top")
     kb.button(text="🎼 Плейлисты",    callback_data="menu:playlists")
     kb.button(text="📊 Статистика",   callback_data="menu:stats")
     kb.button(text="🕘 История",      callback_data="menu:history")
     kb.button(text="⚙ Настройки",     callback_data="menu:settings")
-    kb.adjust(2, 2, 2, 1)
+    kb.adjust(2, 2, 2)
     return kb.as_markup()
 
 
