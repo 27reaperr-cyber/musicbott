@@ -1,13 +1,11 @@
 """
-downloader.py — Поиск через YouTube Music (ytmusicapi) + скачивание через yt-dlp.
-
-Поиск: ytmusicapi.search(..., filter="songs")  — треки из YT Music каталога.
-Загрузка: yt-dlp по videoId → mp3 192kbps через FFmpeg.
-Кеш: ./cache/<videoId>.mp3, TTL 24 часа.
+downloader.py — Поиск через ytmusicapi + скачивание + обработка скорости (FFmpeg).
 """
 
 import asyncio
 import logging
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import TypedDict
@@ -27,12 +25,6 @@ from config import (
 log = logging.getLogger("downloader")
 
 _semaphore = asyncio.Semaphore(DOWNLOAD_SEMAPHORE)
-
-# ─────────────────────────────────────────────
-# YTMusic клиент
-# Без аккаунта = публичный доступ.
-# Для аккаунта: положите headers_auth.json рядом с main.py
-# ─────────────────────────────────────────────
 
 _AUTH_FILE = Path(__file__).parent / "headers_auth.json"
 
@@ -66,6 +58,11 @@ def _cache_path(video_id: str) -> Path:
     return CACHE_DIR / f"{video_id}.mp3"
 
 
+def _speed_path(video_id: str, mode: str) -> Path:
+    """mode: 'sup' (speed up) или 'slo' (slowed)."""
+    return CACHE_DIR / f"{video_id}_{mode}.mp3"
+
+
 def _is_cached(video_id: str) -> bool:
     p = _cache_path(video_id)
     if not p.exists():
@@ -74,12 +71,11 @@ def _is_cached(video_id: str) -> bool:
 
 
 def make_hash(video_id: str) -> str:
-    """track_hash == videoId — уже уникален."""
     return video_id
 
 
 # ─────────────────────────────────────────────
-# ПАРСИНГ РЕЗУЛЬТАТОВ ytmusicapi
+# ПАРСИНГ ytmusicapi
 # ─────────────────────────────────────────────
 
 def _parse_duration(raw) -> int:
@@ -101,16 +97,12 @@ def _parse_result(item: dict) -> dict | None:
     video_id = item.get("videoId")
     if not video_id:
         return None
-
-    title = item.get("title") or "Unknown"
-    artists = item.get("artists") or []
+    title    = item.get("title") or "Unknown"
+    artists  = item.get("artists") or []
     performer = artists[0]["name"] if artists else (item.get("artist") or "Unknown")
-    duration = _parse_duration(
-        item.get("duration_seconds") or item.get("duration") or 0
-    )
+    duration = _parse_duration(item.get("duration_seconds") or item.get("duration") or 0)
     if duration and duration > MAX_DURATION_SEC:
         return None
-
     return {
         "title":      title,
         "performer":  performer,
@@ -122,7 +114,7 @@ def _parse_result(item: dict) -> dict | None:
 
 
 # ─────────────────────────────────────────────
-# СИНХРОННЫЕ ВЫЗОВЫ (executor)
+# СИНХРОННЫЕ ВЫЗОВЫ
 # ─────────────────────────────────────────────
 
 def _sync_search_ytm(query: str, count: int = 5) -> list[dict]:
@@ -136,7 +128,6 @@ def _sync_search_ytm(query: str, count: int = 5) -> list[dict]:
         except Exception:
             pass
         return []
-
     results = []
     for item in raw:
         parsed = _parse_result(item)
@@ -155,13 +146,11 @@ def _sync_download_ytdlp(video_id: str, out_tmpl: str) -> bool:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": AUDIO_BITRATE.rstrip("k"),
-            }
-        ],
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": AUDIO_BITRATE.rstrip("k"),
+        }],
         "socket_timeout": 30,
         "retries": 3,
         "http_headers": {
@@ -176,8 +165,46 @@ def _sync_download_ytdlp(video_id: str, out_tmpl: str) -> bool:
             ydl.download([url])
             return True
         except yt_dlp.utils.DownloadError as e:
-            log.error("yt-dlp download error %s: %s", video_id, e)
+            log.error("yt-dlp error %s: %s", video_id, e)
             return False
+
+
+def _sync_process_speed(input_path: str, output_path: str, speed: float) -> bool:
+    """
+    Изменяет скорость И тональность через asetrate (натуральный эффект виниловой пластинки).
+    speed=1.2 → Speed Up (+20%, тональность выше)
+    speed=0.8 → Slowed  (−20%, тональность ниже)
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        log.error("FFmpeg не найден для обработки скорости")
+        return False
+
+    base_rate = 44100
+    new_rate = int(base_rate * speed)
+
+    cmd = [
+        ffmpeg, "-y",
+        "-i", input_path,
+        "-filter:a", f"asetrate={new_rate},aresample={base_rate}",
+        "-c:a", "libmp3lame",
+        "-b:a", AUDIO_BITRATE,
+        output_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=120
+        )
+        if result.returncode != 0:
+            log.error("FFmpeg speed error: %s", result.stderr.decode(errors="replace"))
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        log.error("FFmpeg timeout при обработке скорости")
+        return False
+    except Exception as e:
+        log.error("FFmpeg exception: %s", e)
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -185,10 +212,7 @@ def _sync_download_ytdlp(video_id: str, out_tmpl: str) -> bool:
 # ─────────────────────────────────────────────
 
 async def search_list(query: str, count: int = 5) -> list[dict]:
-    """
-    Поиск треков в YouTube Music.
-    Возвращает: title, performer, duration, url, track_hash, video_id.
-    """
+    """Поиск треков. Возвращает title, performer, duration, url, track_hash."""
     loop = asyncio.get_event_loop()
     backoff = 2
     for attempt in range(3):
@@ -208,7 +232,7 @@ async def download_by_url(
     performer: str,
     duration: int,
 ) -> TrackInfo | None:
-    """Скачивает трек по videoId (track_hash == videoId)."""
+    """Скачивает трек по videoId."""
     video_id = track_hash
 
     if _is_cached(video_id):
@@ -221,7 +245,6 @@ async def download_by_url(
     async with _semaphore:
         loop = asyncio.get_event_loop()
         out_tmpl = str(CACHE_DIR / f"{video_id}.%(ext)s")
-
         backoff = 2
         success = False
         for attempt in range(3):
@@ -239,13 +262,12 @@ async def download_by_url(
 
         mp3_path = _cache_path(video_id)
         if not mp3_path.exists():
-            log.error("MP3 не найден после загрузки: %s", mp3_path)
+            log.error("MP3 не найден: %s", mp3_path)
             return None
 
         real_size_mb = mp3_path.stat().st_size / 1024 / 1024
         if real_size_mb > MAX_FILE_SIZE_MB:
             mp3_path.unlink(missing_ok=True)
-            log.info("Файл превысил лимит (%.1fMB)", real_size_mb)
             return None
 
         return TrackInfo(
@@ -254,8 +276,40 @@ async def download_by_url(
         )
 
 
+async def process_speed(track_hash: str, mode: str) -> str | None:
+    """
+    Обрабатывает уже скачанный трек.
+    mode: 'up' (1.2x Speed Up) | 'slo' (0.8x Slowed)
+    Возвращает путь к обработанному файлу или None при ошибке.
+    """
+    speed_map = {"up": 1.2, "slo": 0.8}
+    if mode not in speed_map:
+        return None
+
+    input_path  = _cache_path(track_hash)
+    output_path = _speed_path(track_hash, mode)
+
+    if not input_path.exists():
+        log.error("Исходный файл не найден для speed-обработки: %s", input_path)
+        return None
+
+    # Возвращаем кеш если уже обработан
+    if output_path.exists():
+        return str(output_path)
+
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(
+        None,
+        _sync_process_speed,
+        str(input_path),
+        str(output_path),
+        speed_map[mode],
+    )
+    return str(output_path) if ok else None
+
+
 async def search_and_download(query: str) -> TrackInfo | None:
-    """Найти первый трек и сразу скачать (для истории/топа)."""
+    """Быстрый путь: первый результат → сразу скачать."""
     results = await search_list(query, count=1)
     if not results:
         return None
