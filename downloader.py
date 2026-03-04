@@ -86,7 +86,7 @@ def _ydl_opts(output_path: str) -> dict:
 
 
 def _sync_extract_info(query: str) -> dict | None:
-    """Синхронный вызов yt-dlp для получения метаданных."""
+    """Синхронный вызов yt-dlp для получения метаданных одного трека."""
     opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
@@ -110,6 +110,44 @@ def _sync_extract_info(query: str) -> dict | None:
     return info
 
 
+def _sync_search_list(query: str, count: int = 5) -> list[dict]:
+    """Синхронный поиск нескольких треков (без скачивания)."""
+    opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,   # быстро — только метаданные
+        "socket_timeout": 30,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        try:
+            info = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
+        except yt_dlp.utils.DownloadError as e:
+            log.warning("yt-dlp search_list error: %s", e)
+            return []
+
+    if not info:
+        return []
+    entries = info.get("entries") or []
+
+    results = []
+    for e in entries:
+        if not e:
+            continue
+        duration = int(e.get("duration") or 0)
+        if duration > MAX_DURATION_SEC:
+            continue
+        results.append({
+            "title":     e.get("title", "Unknown"),
+            "performer": e.get("uploader") or e.get("channel") or "Unknown",
+            "duration":  duration,
+            "url":       e.get("webpage_url") or e.get("url", ""),
+            "track_hash": make_hash(e.get("webpage_url") or e.get("url") or e.get("title", "")),
+        })
+    return results
+
+
 def _sync_download(url: str, out_tmpl: str) -> bool:
     """Синхронная загрузка через yt-dlp."""
     opts = _ydl_opts(out_tmpl)
@@ -126,9 +164,25 @@ def _sync_download(url: str, out_tmpl: str) -> bool:
 # ПУБЛИЧНЫЙ API
 # ─────────────────────────────────────────────
 
-async def search_and_download(query: str) -> TrackInfo | None:
+async def search_list(query: str, count: int = 5) -> list[dict]:
     """
-    Ищет трек, скачивает mp3, возвращает TrackInfo.
+    Быстрый поиск нескольких треков (только метаданные, без скачивания).
+    Возвращает список: title, performer, duration, url, track_hash.
+    """
+    loop = asyncio.get_event_loop()
+    backoff = 2
+    for attempt in range(3):
+        results = await loop.run_in_executor(None, _sync_search_list, query, count)
+        if results:
+            return results
+        log.warning("search_list попытка %d пустая, жду %ds", attempt + 1, backoff)
+        await asyncio.sleep(backoff)
+        backoff *= 2
+    return []
+
+
+async def search_and_download(query: str) -> TrackInfo | None:
+    """Ищет трек, скачивает mp3, возвращает TrackInfo.
     Возвращает None при любой ошибке или превышении лимитов.
     """
     track_hash = make_hash(query)
@@ -226,3 +280,51 @@ async def _fetch(query: str, track_hash: str) -> TrackInfo | None:
         file_path=str(mp3_path),
         track_hash=track_hash,
     )
+
+
+async def download_by_url(
+    url: str,
+    track_hash: str,
+    title: str,
+    performer: str,
+    duration: int,
+) -> TrackInfo | None:
+    """
+    Скачивает трек по точному URL (выбранному пользователем из списка).
+    track_hash уже известен — генерируется по URL при поиске.
+    """
+    if _is_cached(track_hash):
+        log.info("Кеш-хит по URL: %s", track_hash[:8])
+        return TrackInfo(
+            title=title,
+            performer=performer,
+            duration=duration,
+            file_path=str(_cache_path(track_hash)),
+            track_hash=track_hash,
+        )
+
+    async with _semaphore:
+        loop = asyncio.get_event_loop()
+        out_tmpl = str(CACHE_DIR / f"{track_hash}.%(ext)s")
+        success = await loop.run_in_executor(None, _sync_download, url, out_tmpl)
+        if not success:
+            return None
+
+        mp3_path = _cache_path(track_hash)
+        if not mp3_path.exists():
+            log.error("MP3 не найден после загрузки: %s", mp3_path)
+            return None
+
+        real_size_mb = mp3_path.stat().st_size / 1024 / 1024
+        if real_size_mb > MAX_FILE_SIZE_MB:
+            mp3_path.unlink(missing_ok=True)
+            log.info("Файл превысил лимит размера (%.1fMB)", real_size_mb)
+            return None
+
+        return TrackInfo(
+            title=title,
+            performer=performer,
+            duration=duration,
+            file_path=str(mp3_path),
+            track_hash=track_hash,
+        )

@@ -20,7 +20,7 @@ import database as db
 import playlists as pl
 import stats as stats_mod
 import history as hist_mod
-from downloader import search_and_download
+from downloader import search_and_download, search_list, download_by_url
 from rate_limiter import limiter
 from top_engine import get_global_top, get_trending, format_top_list
 from wave_engine import build_wave
@@ -35,7 +35,8 @@ router = Router()
 # ─────────────────────────────────────────────
 
 class SearchFSM(StatesGroup):
-    waiting_query = State()
+    waiting_query   = State()
+    showing_results = State()   # пользователь видит список, ждём выбора
 
 
 class PlaylistFSM(StatesGroup):
@@ -112,59 +113,111 @@ async def cb_search(cb: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.message(SearchFSM.waiting_query)
-async def handle_search_query(message: Message, state: FSMContext) -> None:
-    query = message.text.strip()
-    if not query:
-        return
-
+async def _do_search(message: Message, state: FSMContext, query: str) -> None:
+    """Общая логика поиска: показать список результатов."""
     await state.clear()
-    user_id = await _ensure_user(message.from_user)
 
-    # Уведомление
-    wait_msg = await message.answer("🔎 Ищу трек...")
+    wait_msg = await message.answer("🔎 Ищу треки...")
 
     try:
-        track = await search_and_download(query)
+        results = await search_list(query, count=5)
     except Exception as e:
         log.exception("Ошибка поиска: %s", e)
         limiter.record_error(message.from_user.id)
-        await wait_msg.edit_text(
-            "❌ Ошибка при поиске. Попробуйте позже.",
-            reply_markup=ui.back_to_main_kb(),
-        )
+        await wait_msg.edit_text("❌ Ошибка при поиске. Попробуйте позже.", reply_markup=ui.back_to_main_kb())
         return
 
-    if not track:
+    if not results:
         limiter.record_error(message.from_user.id)
         await wait_msg.edit_text(
-            "😕 Трек не найден или превышены ограничения (> 10 мин / > 50 МБ).",
+            "😕 Ничего не найдено. Попробуйте другой запрос.",
             reply_markup=ui.back_to_main_kb(),
         )
         return
 
     limiter.record_success(message.from_user.id)
 
-    # Сохраняем в БД
-    await db.upsert_track(
-        track["track_hash"],
-        track["title"],
-        track["performer"],
-        track["duration"],
+    # Сохраняем результаты в FSM и переходим в состояние выбора
+    await state.set_state(SearchFSM.showing_results)
+    await state.update_data(results=results, query=query)
+
+    lines = [f"🔍 <b>Результаты по запросу:</b> <i>{query}</i>\n"]
+    for i, t in enumerate(results, 1):
+        title = t.get("title", "?")
+        perf  = t.get("performer", "")
+        dur   = t.get("duration", 0)
+        mins, sec = divmod(dur, 60)
+        dur_str = f"{mins}:{sec:02d}" if dur else "?:??"
+        lines.append(f"{i}. <b>{perf}</b> — {title}  <code>[{dur_str}]</code>")
+
+    await wait_msg.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=ui.search_results_kb(results),
     )
+
+
+@router.message(SearchFSM.waiting_query)
+async def handle_search_query(message: Message, state: FSMContext) -> None:
+    query = message.text.strip()
+    if not query:
+        return
+    await _do_search(message, state, query)
+
+
+@router.callback_query(F.data.startswith("pick:"), SearchFSM.showing_results)
+async def cb_pick_track(cb: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь выбрал трек из списка."""
+    idx = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    results: list[dict] = data.get("results", [])
+
+    if idx >= len(results):
+        await cb.answer("❌ Трек не найден.", show_alert=True)
+        return
+
+    chosen = results[idx]
+    await cb.answer("⏳ Скачиваю...")
+    await state.clear()
+
+    user_id = await _ensure_user(cb.from_user)
+
+    wait_msg = await cb.message.edit_text(
+        f"⏳ Скачиваю: <b>{chosen['performer']} — {chosen['title']}</b>",
+        parse_mode="HTML",
+    )
+
+    try:
+        track = await download_by_url(
+            url=chosen["url"],
+            track_hash=chosen["track_hash"],
+            title=chosen["title"],
+            performer=chosen["performer"],
+            duration=chosen["duration"],
+        )
+    except Exception as e:
+        log.exception("Ошибка скачивания: %s", e)
+        track = None
+
+    if not track:
+        limiter.record_error(cb.from_user.id)
+        await wait_msg.edit_text("❌ Не удалось скачать трек. Попробуйте другой.", reply_markup=ui.back_to_main_kb())
+        return
+
+    limiter.record_success(cb.from_user.id)
+
+    await db.upsert_track(track["track_hash"], track["title"], track["performer"], track["duration"])
     await db.increment_unique_user(track["track_hash"], user_id)
     await hist_mod.record_play(user_id, track["track_hash"])
 
     await wait_msg.delete()
-
-    # Отправляем аудио
     audio_file = FSInputFile(track["file_path"])
-    await message.answer_audio(
+    await cb.message.answer_audio(
         audio=audio_file,
         title=track["title"],
         performer=track["performer"],
         duration=track["duration"],
-        caption="🎵 Найдено! Используй /start для возврата в меню.",
+        reply_markup=ui.back_to_main_kb(),
     )
 
 
@@ -525,3 +578,26 @@ async def cb_clear_history_confirm(cb: CallbackQuery) -> None:
         await conn.execute("DELETE FROM history WHERE user_id=?", (user_id,))
         await conn.commit()
     await cb.message.edit_text("✅ История очищена.", reply_markup=ui.back_to_main_kb())
+
+
+# ─────────────────────────────────────────────
+# ПОИСК ВНЕ МЕНЮ (любой текст без активного FSM)
+# ─────────────────────────────────────────────
+
+@router.message(F.text, ~F.text.startswith("/"))
+async def handle_freetext_search(message: Message, state: FSMContext) -> None:
+    """
+    Любое текстовое сообщение вне FSM запускает поиск.
+    Команды (начинающиеся с /) — игнорируются этим хендлером.
+    """
+    current_state = await state.get_state()
+    # Если уже в каком-либо FSM — не перехватываем
+    if current_state is not None:
+        return
+
+    await _ensure_user(message.from_user)
+    query = message.text.strip()
+    if not query:
+        return
+
+    await _do_search(message, state, query)

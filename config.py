@@ -44,7 +44,7 @@ MAX_TRACKS_PER_PLAYLIST: int = 200
 # ─────────────────────────────────────────────
 # АНТИСПАМ / RATE LIMIT
 # ─────────────────────────────────────────────
-RATE_LIMIT_SECONDS: int  = 5          # 1 запрос / 5 сек
+RATE_LIMIT_SECONDS: int  = 1          # 1 запрос / 1 сек
 FLOOD_THRESHOLD: int     = 10         # запросов за минуту → mute
 FLOOD_MUTE_MINUTES: int  = 10
 ERROR_THRESHOLD: int     = 5          # ошибок подряд → блок

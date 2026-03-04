@@ -161,7 +161,24 @@ def wave_results_kb(tracks: list[dict]) -> InlineKeyboardMarkup:
 # ПОИСК
 # ─────────────────────────────────────────────
 
-def cancel_search_kb() -> InlineKeyboardMarkup:
+def search_results_kb(tracks: list[dict]) -> InlineKeyboardMarkup:
+    """Список найденных треков для выбора."""
+    kb = InlineKeyboardBuilder()
+    for i, t in enumerate(tracks):
+        title    = (t.get("title") or "?")[:28]
+        dur      = t.get("duration", 0)
+        mins, sec = divmod(dur, 60)
+        dur_str  = f"{mins}:{sec:02d}" if dur else "?:??"
+        kb.button(
+            text=f"{i+1}. {title}  [{dur_str}]",
+            callback_data=f"pick:{i}",
+        )
+    kb.button(text="❌ Отмена", callback_data="menu:main")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+
     kb = InlineKeyboardBuilder()
     kb.button(text="❌ Отмена", callback_data="menu:main")
     return kb.as_markup()
