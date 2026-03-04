@@ -370,7 +370,7 @@ async def cb_download_by_hash(cb: CallbackQuery) -> None:
 async def cb_top_menu(cb: CallbackQuery) -> None:
     await cb.answer()
     await cb.message.edit_text(
-        "🔥 <b>Топ треков</b>\n\nВыберите список:",
+        "🔥 <b>Топ треков</b>",
         parse_mode="HTML", reply_markup=ui.top_menu_kb(),
     )
 
@@ -380,15 +380,6 @@ async def cb_top_global(cb: CallbackQuery) -> None:
     await cb.answer()
     tracks = await get_global_top()
     text = format_top_list(tracks, "🏆 <b>Глобальный топ</b>")
-    kb = ui.top_tracks_kb(tracks, "dl_hash") if tracks else ui.top_menu_kb()
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-
-
-@router.callback_query(F.data == "top:trending")
-async def cb_top_trending(cb: CallbackQuery) -> None:
-    await cb.answer()
-    tracks = await get_trending()
-    text = format_top_list(tracks, "🔥 <b>Trending 24ч</b>")
     kb = ui.top_tracks_kb(tracks, "dl_hash") if tracks else ui.top_menu_kb()
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 

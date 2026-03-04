@@ -92,10 +92,9 @@ def cancel_search_kb() -> InlineKeyboardMarkup:
 
 def top_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🏆 Глобальный топ",  callback_data="top:global")
-    kb.button(text="🔥 Trending 24ч",    callback_data="top:trending")
-    kb.button(text="🏠 Главное меню",    callback_data="menu:main")
-    kb.adjust(2, 1)
+    kb.button(text="🏆 Глобальный топ", callback_data="top:global")
+    kb.button(text="🏠 Главное меню",   callback_data="menu:main")
+    kb.adjust(1)
     return kb.as_markup()
 
 
